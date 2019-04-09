@@ -21,3 +21,5 @@ For S3 we have a dummy bucket called `test-bucket-for-any-garbage` which stores 
 Mozilla developers can get access from a taskcluster developer, or you can setup a custom a bucket and overwrite the bucket name as well as the credentials.
 
 Same thing applies for azure, though it's not as nicely scoped, and doesn't clean up on its own.
+
+bump
