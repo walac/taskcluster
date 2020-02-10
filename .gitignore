@@ -54,3 +54,4 @@ next-task-user.json
 /revision.txt
 /workers/generic-worker/generic-worker-*
 /workers/generic-worker/generic-worker
+target/
