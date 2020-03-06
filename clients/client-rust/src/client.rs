@@ -4,10 +4,14 @@ use crypto::hmac::Hmac;
 use crypto::mac::Mac;
 use crypto::sha2::Sha256;
 use failure::{err_msg, format_err, Error, ResultExt};
+use hawk;
+use reqwest;
+use reqwest::header::HeaderValue;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json;
 use std::env;
 use std::iter::FromIterator;
+use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
 /// Credentials represents the set of credentials required to access protected
@@ -68,15 +72,13 @@ struct Certificate {
 /// contains authentication credentials, and a service endpoint, which are
 /// required for all HTTP operations.
 #[derive(Debug, Clone)]
-pub struct Client {
+pub struct Client<'a> {
     /// The credentials associated with this client. If authenticated request is made if None
-    pub credentials: Option<Credentials>,
-    /// The Root URL of the Taskcluster deployment
-    pub root_url: String,
-    /// The (short) name of the service being accessed
-    pub service_name: String,
-    /// The API version of the service being accessed
-    pub api_version: String,
+    credentials: Option<&'a Credentials>,
+    /// The request URL
+    url: reqwest::Url,
+    /// Request client
+    client: reqwest::Client,
 }
 
 fn gen_temp_access_token(perm_access_token: &str, seed: &str) -> String {
@@ -91,6 +93,109 @@ fn collect_scopes<R: FromIterator<String>>(
     match scopes {
         Some(scopes) => Some(scopes.into_iter().map(|s| s.as_ref().to_string()).collect()),
         None => None,
+    }
+}
+
+impl<'a> Client<'a> {
+    /// Request is the underlying method that makes a raw API request,
+    /// performing any json marshaling/unmarshaling of requests/responses.
+    pub async fn request<B: serde::Serialize>(
+        &self,
+        method: &str,
+        path: &str,
+        body: B,
+    ) -> Result<reqwest::Response, Error> {
+        let req = self.build_request(method, path, body)?;
+        let resp = self
+            .client
+            .execute(req)
+            .await
+            .context(format!("Error executing request {}:{}", method, path))?;
+        Ok(resp)
+    }
+
+    fn build_request<B: serde::Serialize>(
+        &self,
+        method: &str,
+        path: &str,
+        body: B,
+    ) -> Result<reqwest::Request, Error> {
+        let body = serde_json::to_string(&body).context(format!(
+            "Error marshaling json body for endpoint '{}'",
+            path
+        ))?;
+
+        let url = self
+            .url
+            .join(path)
+            .context(format!("Error building request with path '{}'", path))?;
+
+        let meth =
+            reqwest::Method::from_str(method).context(format!("Invalid method {}", method))?;
+
+        let req = self
+            .client
+            .request(meth, url)
+            .body(body)
+            .build()
+            .context(format!("Error building the request {}:{}", method, path))?;
+
+        match self.credentials {
+            Some(ref c) => {
+                let creds = hawk::Credentials {
+                    id: c.client_id.clone(),
+                    key: hawk::Key::new(&c.access_token, hawk::SHA256).context(format!(
+                        "Error creating hawk key for client {}",
+                        &c.client_id
+                    ))?,
+                };
+
+                self.sign_request(&creds, req)
+            }
+            None => Ok(req),
+        }
+    }
+
+    fn sign_request(
+        &self,
+        creds: &hawk::Credentials,
+        req: reqwest::Request,
+    ) -> Result<reqwest::Request, Error> {
+        let host = req.url().host_str().ok_or(format_err!(
+            "The root URL {} doesn't contain a host",
+            req.url(),
+        ))?;
+
+        let port = req.url().port_or_known_default().ok_or(format_err!(
+            "Unkown port for protocol {}",
+            self.url.scheme()
+        ))?;
+
+        let signed_req_builder =
+            hawk::RequestBuilder::new(req.method().as_str(), host, port, req.url().path());
+
+        let payload_hash;
+        let signed_req_builder = match req.body() {
+            Some(ref b) => {
+                let b = b.as_bytes().ok_or(format_err!("Body is a stream???"))?;
+                payload_hash = hawk::PayloadHasher::hash("text/json", hawk::SHA256, b)
+                    .context("Error build payload hash")?;
+                signed_req_builder.hash(&payload_hash[..])
+            }
+            None => signed_req_builder,
+        };
+
+        let header = signed_req_builder
+            .request()
+            .make_header(&creds)
+            .context("Error building authorization header")?;
+
+        let token = HeaderValue::from_str(format!("Hawk {}", header).as_str())
+            .context(format!("Invalid header '{}'", header))?;
+
+        let mut req = req;
+        req.headers_mut().insert("Authorization", token);
+        Ok(req)
     }
 }
 
