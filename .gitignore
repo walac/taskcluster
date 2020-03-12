@@ -55,3 +55,4 @@ next-task-user.json
 /workers/generic-worker/generic-worker-*
 /workers/generic-worker/generic-worker
 target/
+/clients/client-rust/Cargo.lock
