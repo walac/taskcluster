@@ -1,4 +1,7 @@
 use crate::slugid;
+use async_std::task;
+use backoff::backoff::Backoff;
+use backoff::ExponentialBackoff;
 use base64;
 use crypto::hmac::Hmac;
 use crypto::mac::Mac;
@@ -10,7 +13,7 @@ use reqwest::header::HeaderValue;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json;
 use std::env;
-use std::iter::FromIterator;
+use std::iter::{FromIterator, Iterator};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
@@ -71,12 +74,12 @@ struct Certificate {
 /// Client is the entry point into all the functionality in this package. It
 /// contains authentication credentials, and a service endpoint, which are
 /// required for all HTTP operations.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Client<'a> {
     /// The credentials associated with this client. If authenticated request is made if None
-    credentials: Option<&'a Credentials>,
+    pub credentials: Option<&'a Credentials>,
     /// The request URL
-    url: reqwest::Url,
+    pub url: reqwest::Url,
     /// Request client
     client: reqwest::Client,
 }
@@ -90,34 +93,108 @@ fn gen_temp_access_token(perm_access_token: &str, seed: &str) -> String {
 fn collect_scopes<R: FromIterator<String>>(
     scopes: Option<impl IntoIterator<Item = impl AsRef<str>>>,
 ) -> Option<R> {
-    match scopes {
-        Some(scopes) => Some(scopes.into_iter().map(|s| s.as_ref().to_string()).collect()),
-        None => None,
-    }
+    scopes.map(|scopes| scopes.into_iter().map(|s| s.as_ref().to_string()).collect())
 }
 
 impl<'a> Client<'a> {
+    pub fn new<'b>(
+        root_url: &str,
+        service_name: &str,
+        version: &str,
+        credentials: Option<&'b Credentials>,
+    ) -> Result<Client<'b>, Error> {
+        Ok(Client {
+            credentials,
+            url: reqwest::Url::parse(root_url)?
+                .join(service_name)?
+                .join(version)?,
+            client: reqwest::Client::new(),
+        })
+    }
+
     /// Request is the underlying method that makes a raw API request,
     /// performing any json marshaling/unmarshaling of requests/responses.
-    pub async fn request<B: serde::Serialize>(
+    pub async fn request<'b, B: serde::Serialize, I>(
         &self,
         method: &str,
         path: &str,
+        query: Option<impl Iterator<Item = (&'b str, &'b str)>>,
         body: B,
     ) -> Result<reqwest::Response, Error> {
-        let req = self.build_request(method, path, body)?;
+        let mut backoff = ExponentialBackoff::default();
+        backoff.reset();
+
+        let req = self.build_request(method, path, query, body)?;
+        let url = req.url().as_str();
+
+        let result = loop {
+            let req = req
+                .try_clone()
+                .ok_or(format_err!("Cannot clone the request {}", url))?;
+
+            let result = self.exec_request(url, method, req).await;
+            if result.is_ok() {
+                break result;
+            }
+
+            match backoff.next_backoff() {
+                Some(duration) => task::sleep(duration).await,
+                None => break result,
+            }
+        };
+
+        let resp = result?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(resp)
+        } else {
+            Err(format_err!(
+                "Error executing request\nmethod: {}\nurl: {}\nstatus: {}({})\nresponse: \"{}\"",
+                method,
+                &url,
+                status.canonical_reason().unwrap_or("Unknown error"),
+                status.as_str(),
+                resp.text()
+                    .await
+                    .unwrap_or_else(|err| format!("Cannot retrieve response body: {}", err)),
+            ))
+        }
+    }
+
+    async fn exec_request(
+        &self,
+        url: &str,
+        method: &str,
+        req: reqwest::Request,
+    ) -> Result<reqwest::Response, Error> {
         let resp = self
             .client
             .execute(req)
             .await
-            .context(format!("Error executing request {}:{}", method, path))?;
-        Ok(resp)
+            .context(format!("Error executing request {}", url))?;
+
+        let status = resp.status();
+        if status.is_server_error() {
+            Err(format_err!(
+                "Error executing request\nmethod: {}\nrequest\nURL: {}\nstatus: {}({})\nresponse: \"{}\"",
+                method,
+                url,
+                status.canonical_reason().unwrap_or("Unknown error"),
+                status.as_str(),
+                resp.text()
+                    .await
+                    .unwrap_or_else(|err| format!("Cannot retrieve response body: {}", err)),
+            ))
+        } else {
+            Ok(resp)
+        }
     }
 
-    fn build_request<B: serde::Serialize>(
+    fn build_request<'b, B: serde::Serialize>(
         &self,
         method: &str,
         path: &str,
+        query: Option<impl Iterator<Item = (&'b str, &'b str)>>,
         body: B,
     ) -> Result<reqwest::Request, Error> {
         let body = serde_json::to_string(&body).context(format!(
@@ -125,10 +202,14 @@ impl<'a> Client<'a> {
             path
         ))?;
 
-        let url = self
+        let mut url = self
             .url
             .join(path)
             .context(format!("Error building request with path '{}'", path))?;
+
+        if let Some(q) = query {
+            url.query_pairs_mut().extend_pairs(q);
+        }
 
         let meth =
             reqwest::Method::from_str(method).context(format!("Invalid method {}", method))?;
@@ -340,8 +421,8 @@ impl Credentials {
 
     #[allow(dead_code)]
     fn certificate(&self) -> Option<Certificate> {
-        match &self.certificate {
-            Some(cert) => Some(serde_json::from_str(&cert).unwrap()),
+        match self.certificate {
+            Some(ref cert) => serde_json::from_str(cert).unwrap(),
             None => None,
         }
     }
