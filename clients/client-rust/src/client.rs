@@ -12,10 +12,20 @@ use reqwest;
 use reqwest::header::HeaderValue;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json;
+use std::borrow::Borrow;
 use std::env;
-use std::iter::{FromIterator, Iterator};
+use std::iter::{FromIterator, IntoIterator, Iterator};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
+
+#[allow(non_upper_case_globals)]
+pub(crate) const NoScopes: Option<Vec<String>> = None;
+
+#[allow(non_upper_case_globals)]
+pub(crate) const NoBody: Option<&str> = None;
+
+#[allow(non_upper_case_globals)]
+pub(crate) const NoQuery: Option<Vec<(String, String)>> = None;
 
 /// Credentials represents the set of credentials required to access protected
 /// Taskcluster HTTP APIs.
@@ -44,22 +54,15 @@ pub struct Credentials {
 
 // deserialize the certificate. If the certificate is an empty string, parse it as None
 fn parse_certificate<'a, D: Deserializer<'a>>(d: D) -> Result<Option<String>, D::Error> {
-    Deserialize::deserialize(d).map(|cert: Option<String>| match cert {
-        Some(cert) => {
-            if cert.is_empty() {
-                None
-            } else {
-                Some(cert)
-            }
-        }
-        None => None,
+    Deserialize::deserialize(d).map(|cert: Option<String>| {
+        cert.and_then(|cert| if cert.is_empty() { None } else { Some(cert) })
     })
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-struct Certificate {
+pub struct Certificate {
     pub version: u32,
     pub scopes: Option<Vec<String>>,
     pub start: i64,
@@ -74,10 +77,10 @@ struct Certificate {
 /// Client is the entry point into all the functionality in this package. It
 /// contains authentication credentials, and a service endpoint, which are
 /// required for all HTTP operations.
-#[derive(Debug)]
-pub struct Client<'a> {
+#[derive(Debug, Clone)]
+pub(crate) struct Client {
     /// The credentials associated with this client. If authenticated request is made if None
-    pub credentials: Option<&'a Credentials>,
+    pub credentials: Option<Credentials>,
     /// The request URL
     pub url: reqwest::Url,
     /// Request client
@@ -96,32 +99,45 @@ fn collect_scopes<R: FromIterator<String>>(
     scopes.map(|scopes| scopes.into_iter().map(|s| s.as_ref().to_string()).collect())
 }
 
-impl<'a> Client<'a> {
+impl Client {
+    /// Instatiate a new client for a taskcluster service.
+    /// The root_url is the taskcluster deployment root url,
+    /// service_name is the name of the service and version
+    /// is the service version
     pub fn new<'b>(
         root_url: &str,
         service_name: &str,
         version: &str,
-        credentials: Option<&'b Credentials>,
-    ) -> Result<Client<'b>, Error> {
+        credentials: Option<Credentials>,
+    ) -> Result<Client, Error> {
         Ok(Client {
             credentials,
-            url: reqwest::Url::parse(root_url)?
-                .join(service_name)?
-                .join(version)?,
+            url: reqwest::Url::parse(root_url)
+                .context(root_url.to_owned())?
+                .join(&format!("/{}/{}/", service_name, version))
+                .context(format!("{} {}", service_name, version))?,
             client: reqwest::Client::new(),
         })
     }
 
-    /// Request is the underlying method that makes a raw API request,
+    /// request is the underlying method that makes a raw API request,
     /// performing any json marshaling/unmarshaling of requests/responses.
-    pub async fn request<'b, B: serde::Serialize, I>(
+    pub async fn request<'a, I, K, V, B>(
         &self,
         method: &str,
         path: &str,
-        query: Option<impl Iterator<Item = (&'b str, &'b str)>>,
-        body: B,
-    ) -> Result<reqwest::Response, Error> {
+        query: Option<I>,
+        body: Option<B>,
+    ) -> Result<reqwest::Response, Error>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<(K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+        B: serde::Serialize,
+    {
         let mut backoff = ExponentialBackoff::default();
+        backoff.max_elapsed_time = Some(Duration::from_secs(5));
         backoff.reset();
 
         let req = self.build_request(method, path, query, body)?;
@@ -143,7 +159,7 @@ impl<'a> Client<'a> {
             }
         };
 
-        let resp = result?;
+        let resp = result.context(format!("{} {}", method, url))?;
         let status = resp.status();
         if status.is_success() {
             Ok(resp)
@@ -167,11 +183,7 @@ impl<'a> Client<'a> {
         method: &str,
         req: reqwest::Request,
     ) -> Result<reqwest::Response, Error> {
-        let resp = self
-            .client
-            .execute(req)
-            .await
-            .context(format!("Error executing request {}", url))?;
+        let resp = self.client.execute(req).await.context(url.to_owned())?;
 
         let status = resp.status();
         if status.is_server_error() {
@@ -190,45 +202,46 @@ impl<'a> Client<'a> {
         }
     }
 
-    fn build_request<'b, B: serde::Serialize>(
+    fn build_request<'b, I, K, V, B>(
         &self,
         method: &str,
         path: &str,
-        query: Option<impl Iterator<Item = (&'b str, &'b str)>>,
-        body: B,
-    ) -> Result<reqwest::Request, Error> {
-        let body = serde_json::to_string(&body).context(format!(
-            "Error marshaling json body for endpoint '{}'",
-            path
-        ))?;
-
-        let mut url = self
-            .url
-            .join(path)
-            .context(format!("Error building request with path '{}'", path))?;
+        query: Option<I>,
+        body: Option<B>,
+    ) -> Result<reqwest::Request, Error>
+    where
+        I: IntoIterator,
+        I::Item: Borrow<(K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+        B: serde::Serialize,
+    {
+        let mut url = self.url.join(path).context(path.to_owned())?;
 
         if let Some(q) = query {
             url.query_pairs_mut().extend_pairs(q);
         }
 
-        let meth =
-            reqwest::Method::from_str(method).context(format!("Invalid method {}", method))?;
+        let meth = reqwest::Method::from_str(method).context(method.to_owned())?;
 
-        let req = self
-            .client
-            .request(meth, url)
-            .body(body)
-            .build()
-            .context(format!("Error building the request {}:{}", method, path))?;
+        let req = self.client.request(meth, url);
+
+        let req = match body {
+            Some(b) => {
+                let body = serde_json::to_string(&b).context(path.to_owned())?;
+                req.body(body)
+            }
+            None => req,
+        };
+
+        let req = req.build().context(format!("{} {}", method, path))?;
 
         match self.credentials {
             Some(ref c) => {
                 let creds = hawk::Credentials {
                     id: c.client_id.clone(),
-                    key: hawk::Key::new(&c.access_token, hawk::SHA256).context(format!(
-                        "Error creating hawk key for client {}",
-                        &c.client_id
-                    ))?,
+                    key: hawk::Key::new(&c.access_token, hawk::SHA256)
+                        .context(c.client_id.to_owned())?,
                 };
 
                 self.sign_request(&creds, req)
@@ -259,20 +272,15 @@ impl<'a> Client<'a> {
         let signed_req_builder = match req.body() {
             Some(ref b) => {
                 let b = b.as_bytes().ok_or(format_err!("Body is a stream???"))?;
-                payload_hash = hawk::PayloadHasher::hash("text/json", hawk::SHA256, b)
-                    .context("Error build payload hash")?;
+                payload_hash = hawk::PayloadHasher::hash("text/json", hawk::SHA256, b)?;
                 signed_req_builder.hash(&payload_hash[..])
             }
             None => signed_req_builder,
         };
 
-        let header = signed_req_builder
-            .request()
-            .make_header(&creds)
-            .context("Error building authorization header")?;
+        let header = signed_req_builder.request().make_header(&creds)?;
 
-        let token = HeaderValue::from_str(format!("Hawk {}", header).as_str())
-            .context(format!("Invalid header '{}'", header))?;
+        let token = HeaderValue::from_str(format!("Hawk {}", header).as_str()).context(header)?;
 
         let mut req = req;
         req.headers_mut().insert("Authorization", token);
@@ -300,13 +308,8 @@ impl Credentials {
                     ))
                 }
             },
-            Ok(cert) => {
-                if cert.is_empty() {
-                    None
-                } else {
-                    Some(cert)
-                }
-            }
+            Ok(cert) if cert.is_empty() => None,
+            Ok(cert) => Some(cert),
         };
 
         Ok(Credentials {
@@ -404,7 +407,7 @@ impl Credentials {
                 String::from(temp_client_id)
             },
             access_token: temp_access_token,
-            certificate: Some(serde_json::to_string(&cert).unwrap()),
+            certificate: Some(serde_json::to_string(&cert)?),
             scopes: self.scopes.clone(),
         })
     }
@@ -419,10 +422,9 @@ impl Credentials {
         self.create_named_temp_creds("", duration, scopes)
     }
 
-    #[allow(dead_code)]
-    fn certificate(&self) -> Option<Certificate> {
+    pub fn certificate(&self) -> Option<Certificate> {
         match self.certificate {
-            Some(ref cert) => serde_json::from_str(cert).unwrap(),
+            Some(ref cert) => Some(serde_json::from_str(cert).unwrap()),
             None => None,
         }
     }
@@ -458,23 +460,26 @@ impl Certificate {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use chrono;
+    use mockito::{mock, server_url};
     use serde::{Deserialize, Serialize};
     use std::fs;
     use std::path;
     use std::time;
+    use tokio;
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct TempCredsTestCase {
         pub description: String,
-        pub perm_creds: super::Credentials,
+        pub perm_creds: Credentials,
         pub seed: String,
         pub start: String,
         pub expiry: String,
         pub temp_creds_name: String,
         pub temp_creds_scopes: Vec<String>,
-        pub expected_temp_creds: super::Credentials,
+        pub expected_temp_creds: Credentials,
     }
 
     fn test_cred(tc: &TempCredsTestCase) {
@@ -492,8 +497,7 @@ mod tests {
 
         let mut cert = temp_creds.certificate().unwrap();
         cert.seed = tc.seed.clone();
-        temp_creds.access_token =
-            super::gen_temp_access_token(&tc.perm_creds.access_token, &cert.seed);
+        temp_creds.access_token = gen_temp_access_token(&tc.perm_creds.access_token, &cert.seed);
         cert.start = start.timestamp_millis();
         cert.expiry = expiry.timestamp_millis();
         cert.sign(&tc.perm_creds.access_token, &temp_creds.client_id);
@@ -511,5 +515,17 @@ mod tests {
         for tc in &test_cases {
             test_cred(&tc);
         }
+    }
+
+    #[tokio::test]
+    async fn test_simple_request() -> Result<(), Error> {
+        let _mock = mock("GET", "/queue/v1/ping").with_status(200).create();
+        let server = server_url();
+
+        let client = Client::new(&server, "queue", "v1", None)?;
+        print!("{:?}", client);
+        let resp = client.request("GET", "ping", NoQuery, NoBody).await?;
+        assert!(resp.status().is_success());
+        Ok(())
     }
 }
