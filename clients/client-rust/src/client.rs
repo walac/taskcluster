@@ -143,7 +143,7 @@ impl Client {
         let req = self.build_request(method, path, query, body)?;
         let url = req.url().as_str();
 
-        let result = loop {
+        let resp = loop {
             let req = req
                 .try_clone()
                 .ok_or(format_err!("Cannot clone the request {}", url))?;
@@ -157,9 +157,8 @@ impl Client {
                 Some(duration) => task::sleep(duration).await,
                 None => break result,
             }
-        };
+        }?;
 
-        let resp = result.context(format!("{} {}", method, url))?;
         let status = resp.status();
         if status.is_success() {
             Ok(resp)
@@ -227,14 +226,14 @@ impl Client {
         let req = self.client.request(meth, url);
 
         let req = match body {
-            Some(b) => {
-                let body = serde_json::to_string(&b).context(path.to_owned())?;
-                req.body(body)
-            }
+            Some(b) => req.json(&b),
             None => req,
         };
 
-        let req = req.build().context(format!("{} {}", method, path))?;
+        let req = req
+            .build()
+            .context(method.to_owned())
+            .context(path.to_owned())?;
 
         match self.credentials {
             Some(ref c) => {
@@ -462,8 +461,9 @@ impl Certificate {
 mod tests {
     use super::*;
     use chrono;
-    use mockito::{mock, server_url};
+    use mockito::{mock, server_url, Matcher};
     use serde::{Deserialize, Serialize};
+    use serde_json::json;
     use std::fs;
     use std::path;
     use std::time;
@@ -523,8 +523,45 @@ mod tests {
         let server = server_url();
 
         let client = Client::new(&server, "queue", "v1", None)?;
-        print!("{:?}", client);
         let resp = client.request("GET", "ping", NoQuery, NoBody).await?;
+        assert!(resp.status().is_success());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_query() -> Result<(), Error> {
+        let _mock = mock("GET", "/queue/v1/test")
+            .match_query(Matcher::UrlEncoded("taskcluster".into(), "test".into()))
+            .match_query(Matcher::UrlEncoded("client".into(), "rust".into()))
+            .with_status(200)
+            .create();
+        let server = server_url();
+
+        let client = Client::new(&server, "queue", "v1", None)?;
+        let resp = client
+            .request(
+                "GET",
+                "test",
+                Some(&[("taskcluster", "test"), ("client", "rust")]),
+                NoBody,
+            )
+            .await?;
+        assert!(resp.status().is_success());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_body() -> Result<(), Error> {
+        let body = json!({"hello": "world"});
+
+        let _mock = mock("POST", "/queue/v1/test")
+            .match_body(Matcher::Json(body.clone()))
+            .with_status(200)
+            .create();
+        let server = server_url();
+
+        let client = Client::new(&server, "queue", "v1", None)?;
+        let resp = client.request("POST", "test", NoQuery, Some(body)).await?;
         assert!(resp.status().is_success());
         Ok(())
     }
